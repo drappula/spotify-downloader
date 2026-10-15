@@ -296,31 +296,30 @@ async def handle_post_client_download(datastar_signals: ReadSignals):
 # HELPERS
 
 
-def resolve_songs(url: str) -> List[Song]:
+def resolve_song_urls(url: str) -> List[str]:
     """
-    Resolve a Spotify URL to a list of Song objects.
+    Resolve a Spotify URL to a list of track URLs.
 
-    Playlist, album and artist URLs are expanded into their tracks.
-    Single track URLs resolve to a one-element list.
+    Playlist, album and artist URLs are expanded via their listings
+    only (no per-track metadata fetch, which is slow) - each track is
+    resolved individually during download so progress shows up
+    immediately. Single track URLs resolve to a one-element list.
 
     ### Arguments
     - url: The Spotify URL to resolve.
 
     ### Returns
-    - The list of Song objects.
+    - The list of track URLs.
     """
 
     if "playlist" in url:
-        playlist = Playlist.from_url(url)
-        return list(map(Song.from_url, playlist.urls))
+        return Playlist.from_url(url, fetch_songs=False).urls
     if "album" in url:
-        album = Album.from_url(url)
-        return list(map(Song.from_url, album.urls))
+        return Album.from_url(url, fetch_songs=False).urls
     if "artist" in url:
-        artist = Artist.from_url(url)
-        return list(map(Song.from_url, artist.urls))
+        return Artist.from_url(url, fetch_songs=False).urls
 
-    return [Song.from_url(url)]
+    return [url]
 
 
 async def _run_download_in_background(signals: Signals):
@@ -365,15 +364,18 @@ async def gen_download(signals: Signals):
         )
 
     try:
-        # Resolve the URL to song(s), expanding playlists, albums
-        # and artists into their tracks.
-        # NOTE: run in a worker thread - the Spotify metadata fetch uses
-        # asyncio.run() internally (SpotipyFree), which cannot be called
-        # from this already-running event loop.
-        songs = await asyncio.to_thread(resolve_songs, signals.song_url)
+        # Resolve to track URLs first (fast listing, no per-track fetch),
+        # then resolve and download one song at a time so progress shows
+        # up immediately instead of after the whole list is fetched.
+        # NOTE: the Spotify metadata fetch uses asyncio.run() internally
+        # (SpotipyFree), which cannot run in this already-running event
+        # loop, so each blocking fetch goes to a worker thread.
+        song_urls = await asyncio.to_thread(resolve_song_urls, signals.song_url)
+        app_state.logger.info(f"Resolved {len(song_urls)} track(s) to download")
 
         # Download Songs
-        for song in songs:
+        for song_url in song_urls:
+            song = await asyncio.to_thread(Song.from_url, song_url)
             app_state.logger.info(f"Downloading song: {song}")
 
             _, path = await client.downloader.pool_download(song)
