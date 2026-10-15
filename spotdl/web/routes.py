@@ -5,7 +5,7 @@ Module which contains the web client routes and functions.
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, List, Optional, cast
 
 # from datastar_py.sse import DatastarEvent
 from datastar_py.fastapi import ReadSignals
@@ -18,6 +18,9 @@ from fastapi.templating import Jinja2Templates
 
 from spotdl._version import __version__
 from spotdl.download.downloader import AUDIO_PROVIDERS, LYRICS_PROVIDERS
+from spotdl.types.album import Album
+from spotdl.types.artist import Artist
+from spotdl.types.playlist import Playlist
 from spotdl.types.song import Song
 from spotdl.utils.config import get_spotdl_path
 from spotdl.utils.ffmpeg import FFMPEG_FORMATS
@@ -290,6 +293,33 @@ async def handle_post_client_download(datastar_signals: ReadSignals):
 # HELPERS
 
 
+def resolve_songs(url: str) -> List[Song]:
+    """
+    Resolve a Spotify URL to a list of Song objects.
+
+    Playlist, album and artist URLs are expanded into their tracks.
+    Single track URLs resolve to a one-element list.
+
+    ### Arguments
+    - url: The Spotify URL to resolve.
+
+    ### Returns
+    - The list of Song objects.
+    """
+
+    if "playlist" in url:
+        playlist = Playlist.from_url(url)
+        return list(map(Song.from_url, playlist.urls))
+    if "album" in url:
+        album = Album.from_url(url)
+        return list(map(Song.from_url, album.urls))
+    if "artist" in url:
+        artist = Artist.from_url(url)
+        return list(map(Song.from_url, artist.urls))
+
+    return [Song.from_url(url)]
+
+
 async def gen_download(signals: Signals):
     """
     Generate the download process for the client.
@@ -319,20 +349,29 @@ async def gen_download(signals: Signals):
         )
 
     try:
-        # Fetch song metadata
-        song = Song.from_url(signals.song_url)
-        app_state.logger.info(f"Downloading song: {song}")
+        # Resolve the URL to song(s), expanding playlists, albums
+        # and artists into their tracks.
+        # NOTE: run in a worker thread - the Spotify metadata fetch uses
+        # asyncio.run() internally (SpotipyFree), which cannot be called
+        # from this already-running event loop.
+        songs = await asyncio.to_thread(resolve_songs, signals.song_url)
 
-        # Download Song
-        _, path = await client.downloader.pool_download(song)
+        # Download Songs
+        for song in songs:
+            app_state.logger.info(f"Downloading song: {song}")
+
+            _, path = await client.downloader.pool_download(song)
+
+            if path is None:
+                app_state.logger.error(f"Failure downloading {song.name}")
+
         yield SSE.patch_elements(f"""
             <button id="download-{signals.song_url}" class="btn btn-primary btn-square">
                     <iconify-icon icon="clarity:check-line" style="font-size: 24px"></iconify-icon>
                 </button>
         """)
 
-        if path is None:
-            app_state.logger.error(f"Failure downloading {song.name}")
+        # return str(path.absolute())
 
         # return str(path.absolute())
 
