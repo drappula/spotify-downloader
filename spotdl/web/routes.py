@@ -140,8 +140,11 @@ async def handle_get_client_search(datastar_signals: ReadSignals):
         )
         yield SSE.redirect("/downloads")
         signals.song_url = signals.search_term
-        async for update in gen_download(signals):
-            yield update
+        # Detach the download from this request: the redirect above
+        # navigates away, closing this stream and cancelling anything
+        # still awaited here. Progress is polled from /downloads.
+        asyncio.create_task(_run_download_in_background(signals))
+        return
 
     songs = get_search_results(signals.search_term)
     yield SSE.patch_elements(
@@ -318,6 +321,19 @@ def resolve_songs(url: str) -> List[Song]:
         return list(map(Song.from_url, artist.urls))
 
     return [Song.from_url(url)]
+
+
+async def _run_download_in_background(signals: Signals):
+    """
+    Consume gen_download() detached from any request lifecycle.
+
+    Download progress is tracked on the client's downloader and polled
+    by /downloads, so the work must survive navigation (which closes
+    the SSE stream that started it and would otherwise cancel it).
+    """
+
+    async for _ in gen_download(signals):
+        pass
 
 
 async def gen_download(signals: Signals):
